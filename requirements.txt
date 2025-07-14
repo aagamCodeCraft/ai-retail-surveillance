@@ -1,0 +1,16 @@
+# Computer Vision
+ultralytics
+opencv-python
+numpy
+face_recognition
+
+# Web Dashboard
+Flask
+
+# Audio Alerting
+simpleaudio
+
+# Object Tracking
+scipy
+scikit-learn
+deep-sort-realtime
