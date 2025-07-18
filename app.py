@@ -1,41 +1,45 @@
 import cv2
 import time
+import os
+from datetime import datetime
 from flask import Flask, Response
+import logging
 
 # Correctly import modules from the 'src' directory.
 from src.detection import detect_persons
 from src.tracking import initialize_tracker, update_tracker_with_detections
 from src.face_recognition_util import load_known_faces, recognize_face
-from src.alerting import trigger_alert
+from src.alerting import trigger_alert, trigger_banned_person_alert
 from src.video_stream import VideoStream
+from src.event_logger import setup_logger
 
-# --- 1. APPLICATION SETUP ---
+logger = setup_logger()
 app = Flask(__name__)
 
-# --- 2. CONFIGURATION ---
+# --- CONFIGURATION (Unchanged) ---
 FRAME_WIDTH, FRAME_HEIGHT = 1280, 720
-TIME_THRESHOLD_SECONDS = 10.0
 FRAME_PROCESSING_INTERVAL = 3
-RE_RECOGNITION_INTERVAL_FRAMES = 15
-# --- NEW: Time To Live (TTL) for tracks without updates ---
-TRACK_TTL_SECONDS = 2.0 
+RE_RECOGNITION_INTERVAL_FRAMES = 15 
+TIME_THRESHOLD_SECONDS = 10.0
+TRACK_TTL_SECONDS = 2.0
 ZONE_START_X, ZONE_START_Y, ZONE_WIDTH, ZONE_HEIGHT = 0, 0, 350, 720
 FORBIDDEN_ZONE = (ZONE_START_X, ZONE_START_Y, ZONE_START_X + ZONE_WIDTH, ZONE_START_Y + ZONE_HEIGHT)
+UNKNOWN_SIGHTINGS_DIR = "unknown_person_sightings"
+if not os.path.exists(UNKNOWN_SIGHTINGS_DIR): os.makedirs(UNKNOWN_SIGHTINGS_DIR)
 
-# --- 3. GLOBAL INITIALIZATION ---
-print("Initializing resources...")
+# --- GLOBAL INITIALIZATION ---
+logger.info("Initializing resources...")
 from ultralytics import YOLO
 model = YOLO('yolov8n.pt')
 tracker = initialize_tracker()
-known_face_encodings, known_face_names = load_known_faces("registered_faces")
+known_face_encodings, known_face_identities = load_known_faces("registered_faces")
 
-print("Starting threaded video stream...")
+logger.info("Starting threaded video stream...")
 vs = VideoStream(src=0, width=FRAME_WIDTH, height=FRAME_HEIGHT).start()
 time.sleep(2.0)
-print("\n--- Initialization Complete. Starting Web Server. ---")
-print("Press CTRL+C to exit.")
+logger.info("Initialization Complete. Starting Web Server.")
 
-# --- 4. MAIN VIDEO PROCESSING LOGIC (DEFINITIVE FIX) ---
+# --- MAIN VIDEO PROCESSING LOGIC (Unchanged) ---
 def process_video_frames():
     frame_count = 0
     last_alert_time = 0
@@ -43,9 +47,7 @@ def process_video_frames():
 
     while True:
         frame = vs.read()
-        if frame is None or vs.stopped:
-            break
-
+        if frame is None: break
         frame_count += 1
         current_time = time.time()
         
@@ -56,85 +58,100 @@ def process_video_frames():
             
             active_track_ids = set()
             for track in tracks:
-                # --- BUG FIX: Only process tracks that were updated in this frame ---
-                if not track.is_confirmed() or track.time_since_update > 0:
-                    continue
+                if not track.is_confirmed() or track.time_since_update > 0: continue
                 
-                track_id = track.track_id
+                track_id, ltrb = track.track_id, track.to_ltrb()
                 active_track_ids.add(track_id)
-                ltrb = track.to_ltrb()
 
-                if track_id not in tracked_persons:
+                is_new_person = track_id not in tracked_persons
+                if is_new_person:
+                    x1, y1, x2, y2 = map(int, ltrb)
+                    person_crop = processing_frame[y1:y2, x1:x2]
+                    name, status, distance = "Unknown", "unknown", 0.0
+                    if person_crop.size > 0:
+                        name, status, distance = recognize_face(known_face_encodings, known_face_identities, person_crop)
+
                     tracked_persons[track_id] = {
-                        "box": ltrb, "name": "Unknown", "distance": 0.0,
-                        "loiter_start_time": None, "alert_triggered": False,
-                        "last_seen_time": current_time # NEW: Track last seen time
+                        "box": ltrb, "name": name, "status": status, "distance": distance,
+                        "loiter_start_time": None, "alert_triggered": False, "last_seen_time": current_time
                     }
+                    log_message = f"Person '{name}' (ID: {track_id}, Status: {status.capitalize()}) detected."
+                    if status == 'unknown': logger.warning(log_message)
+                    else: logger.info(log_message)
+                    
+                    if status == 'unknown':
+                        try:
+                            sighting_filename = os.path.join(UNKNOWN_SIGHTINGS_DIR, f"sighting_id-{track_id}.jpg")
+                            cv2.imwrite(sighting_filename, person_crop)
+                        except Exception: pass
                 
                 person_state = tracked_persons[track_id]
                 person_state.update({"box": ltrb, "last_seen_time": current_time})
 
-                if person_state["name"] == "Unknown" and frame_count % RE_RECOGNITION_INTERVAL_FRAMES == 0:
+                if person_state["status"] == "unknown" and frame_count % RE_RECOGNITION_INTERVAL_FRAMES == 0 and not is_new_person:
                     x1, y1, x2, y2 = map(int, ltrb)
                     person_crop = processing_frame[y1:y2, x1:x2]
                     if person_crop.size > 0:
-                        name, distance = recognize_face(known_face_encodings, known_face_names, person_crop)
-                        if name != "Unknown":
-                            person_state.update({"name": name, "distance": distance, "loiter_start_time": None, "alert_triggered": False})
+                        name, status, dist = recognize_face(known_face_encodings, known_face_identities, person_crop)
+                        if status != "unknown":
+                            logger.info(f"Person ID {track_id} re-identified as '{name}' (Status: {status.capitalize()}).")
+                            person_state.update({"name": name, "status": status, "distance": dist, "loiter_start_time": None, "alert_triggered": False})
                 
-                is_in_zone = False
-                if person_state["name"] == "Unknown":
-                    person_center_x = (ltrb[0] + ltrb[2]) / 2
-                    is_in_zone = (person_center_x > FORBIDDEN_ZONE[0] and person_center_x < FORBIDDEN_ZONE[2])
+                person_center_x = (ltrb[0] + ltrb[2]) / 2
+                is_in_zone = (person_center_x > FORBIDDEN_ZONE[0] and person_center_x < FORBIDDEN_ZONE[2])
 
-                if is_in_zone:
-                    if person_state["loiter_start_time"] is None:
-                        person_state["loiter_start_time"] = current_time
-                    else:
-                        loiter_duration = current_time - person_state["loiter_start_time"]
-                        if loiter_duration > TIME_THRESHOLD_SECONDS and not person_state["alert_triggered"]:
-                            last_alert_time = trigger_alert(frame, last_alert_time)
-                            person_state["alert_triggered"] = True
-                else:
+                if is_in_zone and not person_state["alert_triggered"]:
+                    status = person_state["status"]
+                    if status == "banned":
+                        trigger_banned_person_alert(frame, person_state["name"])
+                        person_state["alert_triggered"] = True
+                    elif status == "unknown":
+                        if person_state["loiter_start_time"] is None:
+                            person_state["loiter_start_time"] = current_time
+                        else:
+                            loiter_duration = current_time - person_state["loiter_start_time"]
+                            if loiter_duration > TIME_THRESHOLD_SECONDS:
+                                last_alert_time = trigger_alert(frame, last_alert_time)
+                                person_state["alert_triggered"] = True
+                elif not is_in_zone:
                     person_state["loiter_start_time"] = None
-                    person_state["alert_triggered"] = False
             
-            # --- BUG FIX: Enforce a Time-To-Live (TTL) on all tracks ---
-            inactive_track_ids = set(tracked_persons.keys()) - active_track_ids
-            stale_track_ids = {
-                tid for tid, p in tracked_persons.items()
-                if current_time - p["last_seen_time"] > TRACK_TTL_SECONDS
-            }
-            ids_to_remove = inactive_track_ids.union(stale_track_ids)
-            
-            for inactive_id in ids_to_remove:
-                if inactive_id in tracked_persons:
-                    del tracked_persons[inactive_id]
-
+            inactive_ids = set(tracked_persons.keys()) - active_track_ids
+            stale_ids = {tid for tid, p in tracked_persons.items() if current_time - p["last_seen_time"] > TRACK_TTL_SECONDS}
+            for inactive_id in inactive_ids.union(stale_ids):
+                if inactive_id in tracked_persons: del tracked_persons[inactive_id]
+        
+        # --- MODIFIED: Drawing Logic with Corrected Color Scheme ---
         for track_id, person in tracked_persons.items():
             x1, y1, x2, y2 = map(int, person["box"])
-            identity = person["name"]
-            box_color = (255, 0, 0) if identity != "Unknown" else (0, 255, 0)
-            label = f"{identity} (ID: {track_id})"
+            status = person["status"]
+            label = f"{person['name']} (ID: {track_id})"
 
-            if identity != "Unknown":
-                label += f" D:{person['distance']:.2f}"
-            else:
-                if person["loiter_start_time"] is not None:
-                    box_color = (0, 0, 255)
-                    loiter_duration = current_time - person["loiter_start_time"]
-                    label += f" | T: {loiter_duration:.0f}s"
+            # Set box color based on your specified scheme
+            if status == "banned":
+                box_color = (0, 165, 255)  # Orange for Banned
+            elif status == "allowed" or status == "known":
+                box_color = (255, 0, 0)    # Blue for Allowed and Known
+            else: # Unknown
+                box_color = (0, 255, 0)    # Green for Unknown
+
+            # If unknown is loitering, override color to Red
+            if status == "unknown" and person["loiter_start_time"] is not None:
+                box_color = (0, 0, 255)    # Red for Loitering
+                loiter_duration = current_time - person["loiter_start_time"]
+                label += f" | T: {loiter_duration:.0f}s"
             
             cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
             cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
 
+        # Draw Restricted Zone in Red (Unchanged, already correct)
         cv2.rectangle(frame, (FORBIDDEN_ZONE[0], FORBIDDEN_ZONE[1]), (FORBIDDEN_ZONE[2], FORBIDDEN_ZONE[3]), (0, 0, 255), 2)
         cv2.putText(frame, "Restricted Zone", (FORBIDDEN_ZONE[0] + 10, FORBIDDEN_ZONE[1] + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         ret, buffer = cv2.imencode('.jpg', frame)
         if ret: yield (b'--frame\r\n'b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
-# --- 5. FLASK WEB ROUTES (Unchanged) ---
+# --- FLASK WEB ROUTES (Unchanged) ---
 @app.route('/')
 def index():
     return f"""
@@ -157,7 +174,6 @@ if __name__ == '__main__':
     try:
         app.run(host='0.0.0.0', port=5000, debug=False)
     except KeyboardInterrupt:
-        print("Shutdown signal received. Stopping video stream...")
+        logger.info("Shutdown signal received.")
     finally:
         vs.stop()
-        print("Video stream stopped. Exiting.")
